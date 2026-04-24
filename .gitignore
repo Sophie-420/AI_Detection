@@ -1,2 +1,11 @@
+# Dataset and checkpoints
 dataset_mask/
+dataset_512/
+Mask_Model/
 
+# System related
+__pycache__
+.DS_Store
+
+# Envirnment
+venv
