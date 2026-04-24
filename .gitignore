@@ -9,8 +9,12 @@ Mask_Model/
 __pycache__
 .DS_Store
 
-# Envirnment
+# Python envirnment
 venv
+.venv
 
 # Scripts
 prepare_pure_data.py
+
+# Agent
+CLAUDE.md 

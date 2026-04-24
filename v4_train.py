@@ -2,10 +2,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import timm
-from torchvision import transforms
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.amp import autocast, GradScaler
 import os
-from PIL import Image
 import cv2
 import numpy as np
 import random
@@ -17,7 +16,7 @@ from tqdm import tqdm
 
 # ─────────────────────────── Dataset ────────────────────────────
 
-def sample_dataset(img_dir, mask_dir, num_samples=None, specific_repeat=3):
+def sample_dataset(img_dir, mask_dir, num_samples=None):
     img_paths = sorted([
         os.path.join(img_dir, f) for f in os.listdir(img_dir)
         if f.lower().endswith(('.png', '.jpg', '.jpeg'))
@@ -44,23 +43,19 @@ def sample_dataset(img_dir, mask_dir, num_samples=None, specific_repeat=3):
                 buckets[key].append((img, mask, idx))
                 break
 
-    print("\n原始数据分布：")
+    print("\n数据分布：")
     for k, v in buckets.items():
         print(f"  {k}: {len(v)}")
 
-    # Use ALL data; specific_position_ai repeated specific_repeat times
     n_cats = len(MODE)
     sampled = []
     for key, items in buckets.items():
         if num_samples is not None:
             items = random.sample(items, min(num_samples // n_cats, len(items)))
-        if key == 'specific_position_ai':
-            sampled.extend(items * specific_repeat)
-        else:
-            sampled.extend(items)
+        sampled.extend(items)
     random.shuffle(sampled)
 
-    print(f"采样后总计: {len(sampled)} (specific ×{specific_repeat})\n")
+    print(f"总计: {len(sampled)}\n")
     imgs, masks, modes = zip(*sampled)
     return list(imgs), list(masks), list(modes)
 
@@ -98,8 +93,8 @@ class MaskDataset(Dataset):
         img = cv2.cvtColor(cv2.imread(self.img_paths[idx]), cv2.COLOR_BGR2RGB)
         mask = np.load(self.mask_paths[idx])
 
-        img = cv2.resize(img, (224, 224))
-        mask = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
+        img = cv2.resize(img, (512, 512))
+        mask = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
         mask = (mask > 0).astype(np.uint8)  # 统一到 {0,1}，修复 random_ai 里的 {0,255}
 
         if self.augment:
@@ -110,7 +105,7 @@ class MaskDataset(Dataset):
         dct = np.log(np.abs(dct) + 1e-6)
         dct = cv2.normalize(dct, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-        img_t = normalize(transforms.ToTensor()(Image.fromarray(img)),
+        img_t = normalize(torch.from_numpy(img).float().permute(2, 0, 1) / 255.0,
                           [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         dct_t = torch.from_numpy(dct).float().unsqueeze(0) / 255.0
         x = torch.cat([img_t, dct_t], dim=0)
@@ -134,6 +129,7 @@ class SwinSeg(nn.Module):
             num_classes=0,
             in_chans=4,
             features_only=True,
+            img_size=512,
         )
         ch = self.backbone.feature_info.channels()  # [96, 192, 384, 768]
 
@@ -148,8 +144,10 @@ class SwinSeg(nn.Module):
         self.fuse2 = self._fuse(256 + 256, 128)
         self.fuse1 = self._fuse(128 + 128, 64)
         self.fuse0 = self._fuse(64  + 64,  32)
+        # Extra stage: 128→256 before final 2× to 512 (avoids coarse 4× jump)
+        self.fuse_out = self._fuse(32, 16)
 
-        self.head = nn.Conv2d(32, 1, 1)
+        self.head = nn.Conv2d(16, 1, 1)
 
     @staticmethod
     def _lateral(in_ch, out_ch):
@@ -173,20 +171,21 @@ class SwinSeg(nn.Module):
     def forward(self, x):
         feats = self.backbone(x)
         f0, f1, f2, f3 = [f.permute(0, 3, 1, 2) for f in feats]
-        # f0:[B,96,56,56]  f1:[B,192,28,28]  f2:[B,384,14,14]  f3:[B,768,7,7]
+        # f0:[B,96,128,128]  f1:[B,192,64,64]  f2:[B,384,32,32]  f3:[B,768,16,16]
 
-        p3 = self.lat3(f3)   # [B, 256,  7,  7]
-        p2 = self.lat2(f2)   # [B, 256, 14, 14]
-        p1 = self.lat1(f1)   # [B, 128, 28, 28]
-        p0 = self.lat0(f0)   # [B,  64, 56, 56]
+        p3 = self.lat3(f3)   # [B, 256, 16, 16]
+        p2 = self.lat2(f2)   # [B, 256, 32, 32]
+        p1 = self.lat1(f1)   # [B, 128, 64, 64]
+        p0 = self.lat0(f0)   # [B,  64,128,128]
 
         d3 = self.fuse3(p3)
         d2 = self.fuse2(torch.cat([self._up(d3), p2], dim=1))
         d1 = self.fuse1(torch.cat([self._up(d2), p1], dim=1))
         d0 = self.fuse0(torch.cat([self._up(d1), p0], dim=1))
 
-        out = self.head(d0)
-        return F.interpolate(out, size=(224, 224), mode='bilinear', align_corners=False)
+        d_out = self.fuse_out(self._up(d0))  # [B, 16, 256, 256]
+        out = self.head(d_out)
+        return F.interpolate(out, size=(512, 512), mode='bilinear', align_corners=False)
 
     @staticmethod
     def _up(x):
@@ -228,17 +227,20 @@ class SegLoss(nn.Module):
 
 # ─────────────────────────── Train / Eval ───────────────────────
 
-def train_epoch(model, loader, optimizer, criterion, device):
+def train_epoch(model, loader, optimizer, criterion, device, scaler):
     model.train()
     total_loss = 0
     loop = tqdm(loader, desc='Train', leave=False)
     for x, mask, _ in loop:
-        x, mask = x.to(device), mask.to(device)
-        optimizer.zero_grad()
-        loss = criterion(model(x), mask)
-        loss.backward()
+        x, mask = x.to(device, non_blocking=True), mask.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast('cuda'):
+            loss = criterion(model(x), mask)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item() * x.size(0)
         loop.set_postfix(loss=f'{loss.item():.3f}')
     return total_loss / len(loader.dataset)
@@ -251,9 +253,9 @@ def evaluate(model, loader, device, threshold=0.5):
             4: ('pure_ai', 0, 0), 5: ('pure_real', 0, 0)}
     total_iou, total_n = 0.0, 0
 
-    with torch.no_grad():
+    with torch.no_grad(), autocast('cuda'):
         for x, mask, modes in loader:
-            x, mask = x.to(device), mask.to(device)
+            x, mask = x.to(device, non_blocking=True), mask.to(device, non_blocking=True)
             pred = (torch.sigmoid(model(x)) > threshold).float()
             for i in range(x.size(0)):
                 inter = (pred[i] * mask[i]).sum()
@@ -351,21 +353,29 @@ TOTAL_EPOCHS = 20
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
+    torch.backends.cudnn.benchmark = True
 
     train_imgs, train_masks, train_modes = sample_dataset(
         './dataset_mask/train/images', './dataset_mask/train/masks')
     val_imgs, val_masks, val_modes = sample_dataset(
         './dataset_mask/val/images', './dataset_mask/val/masks')
 
+    # WeightedRandomSampler: each class sampled equally regardless of count
+    class_counts = [train_modes.count(i) for i in range(6)]
+    sample_weights = [1.0 / class_counts[m] for m in train_modes]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
     train_loader = DataLoader(
         MaskDataset(train_imgs, train_masks, train_modes, augment=True),
-        batch_size=8, shuffle=True, num_workers=0)
+        batch_size=8, sampler=sampler, num_workers=4,
+        pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(
         MaskDataset(val_imgs, val_masks, val_modes, augment=False),
-        batch_size=8, shuffle=False, num_workers=0)
+        batch_size=8, shuffle=False, num_workers=4,
+        pin_memory=True, persistent_workers=True)
 
     model     = SwinSeg().to(device)
     criterion = SegLoss()
+    scaler    = GradScaler('cuda')
 
     save_dir = './Mask_Model/v4'
     os.makedirs(save_dir, exist_ok=True)
@@ -385,7 +395,7 @@ def main():
         lr_bb  = optimizer.param_groups[0]['lr']
         lr_dec = optimizer.param_groups[1]['lr']
         print(f'\nEpoch {epoch+1}/{TOTAL_EPOCHS}  bb_lr={lr_bb:.2e}  dec_lr={lr_dec:.2e}')
-        loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
         scheduler.step()
         _log_epoch(model, val_loader, device, vis, loss, save_dir, best_iou)
         best_iou = max(best_iou, vis.mean_ious[-1])
