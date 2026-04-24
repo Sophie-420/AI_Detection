@@ -1,6 +1,8 @@
 # Dataset and checkpoints
 dataset_mask/
 dataset_512/
+dataset_real/
+dataset_ai/
 Mask_Model/
 
 # System related
@@ -9,3 +11,6 @@ __pycache__
 
 # Envirnment
 venv
+
+# Scripts
+prepare_pure_data.py

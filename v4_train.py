@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 # ─────────────────────────── Dataset ────────────────────────────
 
-def sample_dataset(img_dir, mask_dir, num_samples=None):
+def sample_dataset(img_dir, mask_dir, num_samples=None, specific_repeat=3):
     img_paths = sorted([
         os.path.join(img_dir, f) for f in os.listdir(img_dir)
         if f.lower().endswith(('.png', '.jpg', '.jpeg'))
@@ -33,6 +33,8 @@ def sample_dataset(img_dir, mask_dir, num_samples=None):
         'real_on_fake': 1,
         'random_ai': 2,
         'specific_position_ai': 3,
+        'pure_ai': 4,
+        'pure_real': 5,
     }
 
     buckets = {k: [] for k in MODE}
@@ -46,27 +48,51 @@ def sample_dataset(img_dir, mask_dir, num_samples=None):
     for k, v in buckets.items():
         print(f"  {k}: {len(v)}")
 
-    min_count = min(len(v) for v in buckets.values())
-    per_class = min_count if num_samples is None else min(num_samples // 4, min_count)
-    print(f"每类采样: {per_class}  总计: {per_class * 4}\n")
-
+    # Use ALL data; specific_position_ai repeated specific_repeat times
+    n_cats = len(MODE)
     sampled = []
-    for items in buckets.values():
-        sampled.extend(random.sample(items, per_class))
+    for key, items in buckets.items():
+        if num_samples is not None:
+            items = random.sample(items, min(num_samples // n_cats, len(items)))
+        if key == 'specific_position_ai':
+            sampled.extend(items * specific_repeat)
+        else:
+            sampled.extend(items)
     random.shuffle(sampled)
 
+    print(f"采样后总计: {len(sampled)} (specific ×{specific_repeat})\n")
     imgs, masks, modes = zip(*sampled)
     return list(imgs), list(masks), list(modes)
 
 
 class MaskDataset(Dataset):
-    def __init__(self, img_paths, mask_paths, modes):
+    def __init__(self, img_paths, mask_paths, modes, augment=False):
         self.img_paths = img_paths
         self.mask_paths = mask_paths
         self.modes = modes
+        self.augment = augment
 
     def __len__(self):
         return len(self.img_paths)
+
+    @staticmethod
+    def _augment(img, mask):
+        if random.random() > 0.5:
+            img = cv2.flip(img, 1); mask = cv2.flip(mask, 1)
+        if random.random() > 0.5:
+            img = cv2.flip(img, 0); mask = cv2.flip(mask, 0)
+        angle = random.uniform(-15, 15)
+        h, w = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+        img  = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR)
+        mask = cv2.warpAffine(mask.astype(np.float32), M, (w, h),
+                              flags=cv2.INTER_NEAREST)
+        mask = (mask > 0.5).astype(np.uint8)
+        # Color jitter — image only
+        alpha = random.uniform(0.8, 1.2)
+        beta  = random.uniform(-20, 20)
+        img   = np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
+        return img, mask
 
     def __getitem__(self, idx):
         img = cv2.cvtColor(cv2.imread(self.img_paths[idx]), cv2.COLOR_BGR2RGB)
@@ -75,6 +101,9 @@ class MaskDataset(Dataset):
         img = cv2.resize(img, (224, 224))
         mask = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
         mask = (mask > 0).astype(np.uint8)  # 统一到 {0,1}，修复 random_ai 里的 {0,255}
+
+        if self.augment:
+            img, mask = self._augment(img, mask)
 
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         dct = cv2.dct(np.float32(gray))
@@ -174,14 +203,27 @@ class DiceLoss(nn.Module):
         return 1 - ((2 * inter + 1e-6) / (pred.sum(dim=1) + target.sum(dim=1) + 1e-6)).mean()
 
 
-class SegLoss(nn.Module):
-    def __init__(self, device, pos_weight=3.0):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]).to(device))
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred, target):
+        bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        p_t = torch.exp(-bce)
+        focal = self.alpha * (1 - p_t) ** self.gamma * bce
+        return focal.mean()
+
+
+class SegLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.focal = FocalLoss(alpha=0.25, gamma=2.0)
         self.dice = DiceLoss()
 
     def forward(self, pred, target):
-        return self.bce(pred, target) + self.dice(pred, target)
+        return self.focal(pred, target) + self.dice(pred, target)
 
 
 # ─────────────────────────── Train / Eval ───────────────────────
@@ -205,7 +247,8 @@ def train_epoch(model, loader, optimizer, criterion, device):
 def evaluate(model, loader, device, threshold=0.5):
     model.eval()
     cats = {0: ('ai_on_real', 0, 0), 1: ('real_on_fake', 0, 0),
-            2: ('random_ai', 0, 0), 3: ('specific_position_ai', 0, 0)}
+            2: ('random_ai', 0, 0), 3: ('specific_position_ai', 0, 0),
+            4: ('pure_ai', 0, 0), 5: ('pure_real', 0, 0)}
     total_iou, total_n = 0.0, 0
 
     with torch.no_grad():
@@ -231,12 +274,15 @@ def evaluate(model, loader, device, threshold=0.5):
 # ─────────────────────────── Visualizer ─────────────────────────
 
 class Visualizer:
-    TASK = {0: 'AI→Real', 1: 'Real→AI', 2: 'Random AI', 3: 'Specific AI'}
+    TASK = {0: 'AI→Real', 1: 'Real→AI', 2: 'Random AI', 3: 'Specific AI',
+            4: 'Pure AI', 5: 'Pure Real'}
     TASK_METRIC = {
         'AI→Real':    'ai_on_real',
         'Real→AI':    'real_on_fake',
         'Random AI':  'random_ai',
         'Specific AI':'specific_position_ai',
+        'Pure AI':    'pure_ai',
+        'Pure Real':  'pure_real',
     }
 
     def __init__(self, save_dir):
@@ -299,8 +345,7 @@ class Visualizer:
 
 # ─────────────────────────── Main ───────────────────────────────
 
-WARMUP_EPOCHS = 5   # 前 N epoch 冻结 backbone，只训练 decoder
-TOTAL_EPOCHS  = 20
+TOTAL_EPOCHS = 20
 
 
 def main():
@@ -312,61 +357,37 @@ def main():
     val_imgs, val_masks, val_modes = sample_dataset(
         './dataset_mask/val/images', './dataset_mask/val/masks')
 
-    train_loader = DataLoader(MaskDataset(train_imgs, train_masks, train_modes),
-                              batch_size=8, shuffle=True, num_workers=0)
-    val_loader   = DataLoader(MaskDataset(val_imgs, val_masks, val_modes),
-                              batch_size=8, shuffle=False, num_workers=0)
+    train_loader = DataLoader(
+        MaskDataset(train_imgs, train_masks, train_modes, augment=True),
+        batch_size=8, shuffle=True, num_workers=0)
+    val_loader = DataLoader(
+        MaskDataset(val_imgs, val_masks, val_modes, augment=False),
+        batch_size=8, shuffle=False, num_workers=0)
 
     model     = SwinSeg().to(device)
-    criterion = SegLoss(device, pos_weight=3.0)
+    criterion = SegLoss()
 
     save_dir = './Mask_Model/v4'
     os.makedirs(save_dir, exist_ok=True)
     vis = Visualizer(save_dir)
     best_iou = 0.0
 
-    # ── Phase 1: backbone frozen, decoder only ──────────────────
-    for param in model.backbone.parameters():
-        param.requires_grad = False
-
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=5e-4, weight_decay=1e-4
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=WARMUP_EPOCHS, eta_min=1e-5)
-
-    print(f'\n=== Phase 1: Warmup ({WARMUP_EPOCHS} epochs, backbone frozen) ===')
-    for epoch in range(WARMUP_EPOCHS):
-        lr = optimizer.param_groups[0]['lr']
-        print(f'\nEpoch {epoch+1}/{TOTAL_EPOCHS}  lr={lr:.2e}  [backbone frozen]')
-        loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        scheduler.step()
-        _log_epoch(model, val_loader, criterion, device, vis, loss, epoch,
-                   save_dir, best_iou)
-        best_iou = max(best_iou, vis.mean_ious[-1])
-
-    # ── Phase 2: full fine-tune with differential lr ────────────
-    for param in model.backbone.parameters():
-        param.requires_grad = True
-
+    # Single-phase: differential lr from epoch 1, no warmup
     optimizer = optim.AdamW([
         {'params': model.backbone.parameters(), 'lr': 5e-6},
         {'params': [p for n, p in model.named_parameters()
                     if 'backbone' not in n], 'lr': 1e-4},
     ], weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=TOTAL_EPOCHS - WARMUP_EPOCHS, eta_min=1e-6)
+        optimizer, T_max=TOTAL_EPOCHS, eta_min=1e-6)
 
-    print(f'\n=== Phase 2: Full fine-tune ({TOTAL_EPOCHS - WARMUP_EPOCHS} epochs) ===')
-    for epoch in range(WARMUP_EPOCHS, TOTAL_EPOCHS):
+    for epoch in range(TOTAL_EPOCHS):
         lr_bb  = optimizer.param_groups[0]['lr']
         lr_dec = optimizer.param_groups[1]['lr']
         print(f'\nEpoch {epoch+1}/{TOTAL_EPOCHS}  bb_lr={lr_bb:.2e}  dec_lr={lr_dec:.2e}')
         loss = train_epoch(model, train_loader, optimizer, criterion, device)
         scheduler.step()
-        _log_epoch(model, val_loader, criterion, device, vis, loss, epoch,
-                   save_dir, best_iou)
+        _log_epoch(model, val_loader, device, vis, loss, save_dir, best_iou)
         best_iou = max(best_iou, vis.mean_ious[-1])
 
         if (epoch + 1) % 5 == 0:
@@ -376,7 +397,7 @@ def main():
     print(f'\n训练完成  best val IoU={best_iou:.4f}')
 
 
-def _log_epoch(model, val_loader, criterion, device, vis, loss, epoch, save_dir, best_iou):
+def _log_epoch(model, val_loader, device, vis, loss, save_dir, best_iou):
     metrics = evaluate(model, val_loader, device)
     vis.losses.append(loss)
     vis.mean_ious.append(metrics['mean_iou'])
@@ -385,7 +406,8 @@ def _log_epoch(model, val_loader, criterion, device, vis, loss, epoch, save_dir,
     print(
         f"Loss {loss:.4f} | Mean {metrics['mean_iou']:.4f} | "
         f"AI→Real {metrics['ai_on_real']:.4f} | Real→AI {metrics['real_on_fake']:.4f} | "
-        f"Random {metrics['random_ai']:.4f} | Specific {metrics['specific_position_ai']:.4f}"
+        f"Random {metrics['random_ai']:.4f} | Specific {metrics['specific_position_ai']:.4f} | "
+        f"PureAI {metrics['pure_ai']:.4f} | PureReal {metrics['pure_real']:.4f}"
     )
     if metrics['mean_iou'] > best_iou:
         torch.save(model.state_dict(), os.path.join(save_dir, 'best_seg.pth'))
