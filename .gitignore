@@ -1,0 +1,20 @@
+# Dataset and checkpoints
+dataset_mask/
+dataset_512/
+dataset_real/
+dataset_ai/
+Mask_Model/
+
+# System related
+__pycache__
+.DS_Store
+
+# Python envirnment
+venv
+.venv
+
+# Scripts
+prepare_pure_data.py
+
+# Agent
+CLAUDE.md 
