@@ -1,7 +1,7 @@
 """
 Inference script for SwinSeg (v4).
 Usage:
-    python infer.py <image_or_folder> [--ckpt best_seg_ft.pth] [--out results/] [--threshold 0.5]
+    python infer.py <image_or_folder> [--ckpt best_seg.pth] [--out results/] [--threshold 0.5]
 
 Outputs per image (saved to --out):
     <name>_original.png   — resized 512×512 original
@@ -123,7 +123,7 @@ def collect_images(path: str):
 def main():
     parser = argparse.ArgumentParser(description='SwinSeg v4 inference')
     parser.add_argument('input', help='Image file or folder')
-    parser.add_argument('--ckpt', default=os.path.join(os.path.dirname(__file__), 'best_seg_ft.pth'))
+    parser.add_argument('--ckpt', default=os.path.join(os.path.dirname(__file__), 'best_seg.pth'))
     parser.add_argument('--out',  default=os.path.join(os.path.dirname(__file__), 'results'))
     parser.add_argument('--threshold', type=float, default=0.5)
     args = parser.parse_args()
