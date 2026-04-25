@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import DataLoader
-from mask_train_model import SwinSeg, MaskDataset, evaluate, Visualizer, sample_dataset
+from history.mask_train_model import SwinSeg, MaskDataset, evaluate, Visualizer, sample_dataset
 
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
