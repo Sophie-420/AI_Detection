@@ -4,6 +4,11 @@ dataset_512/
 dataset_real/
 dataset_ai/
 Mask_Model/
+checkpoints/
+
+# Tests and output
+results/
+output/
 
 # System related
 __pycache__
@@ -18,3 +23,5 @@ prepare_pure_data.py
 
 # Agent
 CLAUDE.md 
+.claude 
+

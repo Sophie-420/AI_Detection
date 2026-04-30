@@ -308,7 +308,9 @@ class Visualizer:
 
     def visualize_segmentation(self, model, loader, device, num_samples=8, tag=''):
         model.eval()
-        samples = []
+        # Collect one sample per class first, then fill remaining slots
+        per_class = {}
+        extras = []
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -316,10 +318,19 @@ class Visualizer:
             for x, mask, mode in loader:
                 pred = torch.sigmoid(model(x.to(device))).cpu()
                 for i in range(x.size(0)):
-                    samples.append((x[i], mask[i], pred[i], mode[i].item()))
-                if len(samples) >= num_samples:
+                    m = mode[i].item()
+                    entry = (x[i], mask[i], pred[i], m)
+                    if m not in per_class:
+                        per_class[m] = entry
+                    else:
+                        extras.append(entry)
+                if len(per_class) == 6 and len(per_class) + len(extras) >= num_samples:
                     break
-        samples = samples[:num_samples]
+
+        samples = list(per_class.values())
+        remaining = num_samples - len(samples)
+        if remaining > 0:
+            samples += extras[:remaining]
 
         fig, axes = plt.subplots(len(samples), 5, figsize=(15, 3 * len(samples)))
         for i, (img, gt, pred, mode) in enumerate(samples):
@@ -331,10 +342,10 @@ class Visualizer:
             union = pred_bin.sum() + gt_map.sum() - inter
             iou = inter / (union + 1e-6)
 
-            axes[i, 0].imshow(rgb);                      axes[i, 0].set_title(self.TASK[mode])
-            axes[i, 1].imshow(gt_map, cmap='gray');      axes[i, 1].set_title('GT')
-            axes[i, 2].imshow(pred_map, cmap='jet');     axes[i, 2].set_title('Heatmap')
-            axes[i, 3].imshow(pred_bin, cmap='gray');    axes[i, 3].set_title(f'Binary IoU={iou:.2f}')
+            axes[i, 0].imshow(rgb);                                   axes[i, 0].set_title(self.TASK[mode])
+            axes[i, 1].imshow(gt_map, cmap='gray', vmin=0, vmax=1);  axes[i, 1].set_title('GT')
+            axes[i, 2].imshow(pred_map, cmap='jet');                  axes[i, 2].set_title('Heatmap')
+            axes[i, 3].imshow(pred_bin, cmap='gray', vmin=0, vmax=1); axes[i, 3].set_title(f'Binary IoU={iou:.2f}')
             overlay = rgb.copy(); overlay[..., 0] = np.clip(overlay[..., 0] + pred_bin * 0.5, 0, 1)
             axes[i, 4].imshow(overlay);                  axes[i, 4].set_title('Overlay')
             for ax in axes[i]: ax.axis('off')
@@ -377,7 +388,7 @@ def main():
     criterion = SegLoss()
     scaler    = GradScaler('cuda')
 
-    save_dir = './Mask_Model/v4'
+    save_dir = os.path.abspath('./Mask_Model/v4')
     os.makedirs(save_dir, exist_ok=True)
     vis = Visualizer(save_dir)
     best_iou = 0.0
